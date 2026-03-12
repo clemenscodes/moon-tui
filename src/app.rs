@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -217,6 +218,22 @@ pub enum Action {
     None,
 }
 
+/// Saved state for a task running in the background (detached but not killed).
+struct TaskState {
+    output_lines: Vec<String>,
+    output_scroll: usize,
+    output_follow: bool,
+    output_finished: bool,
+    output_exit_code: Option<i32>,
+    line_rx: Option<tokio::sync::mpsc::UnboundedReceiver<OutputMsg>>,
+    exit_code_rx: Option<tokio::sync::oneshot::Receiver<Option<i32>>>,
+    stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    vt: Option<vt100::Parser>,
+    pty_scrollback_len: usize,
+    was_alternate_screen: bool,
+    child_pid: Arc<AtomicU32>,
+}
+
 pub struct App {
     pub running: bool,
     pub panel: Panel,
@@ -265,6 +282,9 @@ pub struct App {
 
     // PID of the currently running child process (0 = none).
     pub child_pid: Arc<AtomicU32>,
+
+    // State for tasks that were detached while still running, keyed by "project:task".
+    background_tasks: HashMap<String, TaskState>,
 }
 
 impl App {
@@ -298,6 +318,7 @@ impl App {
             task_rx: None,
             project_rx: None,
             child_pid: Arc::new(AtomicU32::new(0)),
+            background_tasks: HashMap::new(),
         }
     }
 
@@ -668,25 +689,100 @@ impl App {
         }
     }
 
-    /// Check if the given target is already running and re-attach if so.
+    /// Save the current foreground task's state into `background_tasks` so it
+    /// keeps running while we switch to another task.  Does nothing if there
+    /// is no current task or it has already finished.
+    fn save_current_task_state(&mut self) {
+        if self.output_target.is_empty() || self.output_finished {
+            return;
+        }
+        let state = TaskState {
+            output_lines: std::mem::take(&mut self.output_lines),
+            output_scroll: self.output_scroll,
+            output_follow: self.output_follow,
+            output_finished: self.output_finished,
+            output_exit_code: self.output_exit_code,
+            line_rx: self.line_rx.take(),
+            exit_code_rx: self.exit_code_rx.take(),
+            stdin_tx: self.stdin_tx.take(),
+            vt: self.vt.take(),
+            pty_scrollback_len: self.pty_scrollback_len,
+            was_alternate_screen: self.was_alternate_screen,
+            child_pid: Arc::clone(&self.child_pid),
+        };
+        self.background_tasks.insert(self.output_target.clone(), state);
+    }
+
+    /// Returns the PIDs of all live child processes (foreground + background).
+    pub fn all_child_pids(&self) -> Vec<u32> {
+        let mut pids = Vec::new();
+        let pid = self.child_pid.load(std::sync::atomic::Ordering::SeqCst);
+        if pid != 0 {
+            pids.push(pid);
+        }
+        for state in self.background_tasks.values() {
+            let pid = state.child_pid.load(std::sync::atomic::Ordering::SeqCst);
+            if pid != 0 {
+                pids.push(pid);
+            }
+        }
+        pids
+    }
+
+    /// Check if the given target is already running (foreground or background)
+    /// and re-attach if so.
     fn try_reattach(&mut self, project_id: &str, task_id: &str) -> bool {
         let target = format!("{project_id}:{task_id}");
+
+        // Already the foreground task and still running.
         if self.output_target == target && !self.output_finished {
             self.poll_output();
             self.mode = Mode::Output;
             self.output_follow = true;
             self.output_scroll = self.output_lines.len().saturating_sub(1);
             self.set_status(format!("Re-attached to {target}"));
-            true
-        } else {
-            false
+            return true;
         }
+
+        // Check whether the task was sent to the background while still running.
+        if self.background_tasks.get(&target).map_or(false, |s| !s.output_finished) {
+            // Push the current foreground task (if any) into the background.
+            self.save_current_task_state();
+
+            // Restore the background task as the new foreground.
+            let state = self.background_tasks.remove(&target).unwrap();
+            self.output_target = target.clone();
+            self.output_lines = state.output_lines;
+            self.output_scroll = state.output_scroll;
+            self.output_follow = state.output_follow;
+            self.output_finished = state.output_finished;
+            self.output_exit_code = state.output_exit_code;
+            self.line_rx = state.line_rx;
+            self.exit_code_rx = state.exit_code_rx;
+            self.stdin_tx = state.stdin_tx;
+            self.vt = state.vt;
+            self.pty_scrollback_len = state.pty_scrollback_len;
+            self.was_alternate_screen = state.was_alternate_screen;
+            self.child_pid = state.child_pid;
+
+            self.poll_output();
+            self.mode = Mode::Output;
+            self.output_follow = true;
+            self.output_scroll = self.output_lines.len().saturating_sub(1);
+            self.set_status(format!("Re-attached to {target}"));
+            return true;
+        }
+
+        false
     }
 
     fn start_task_run(&mut self, project_id: &str, task_id: &str, force: bool) {
         if self.try_reattach(project_id, task_id) {
             return;
         }
+
+        // Save the current running task (if any) so it keeps running in the background.
+        self.save_current_task_state();
 
         let target = format!("{project_id}:{task_id}");
         self.output_lines.clear();
@@ -700,6 +796,8 @@ impl App {
         self.pty_scrollback_len = 0;
         self.was_alternate_screen = false;
         self.mode = Mode::Output;
+        // Give this task its own PID slot so it doesn't race with background tasks.
+        self.child_pid = Arc::new(AtomicU32::new(0));
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.line_rx = Some(rx);
@@ -725,6 +823,9 @@ impl App {
             return;
         }
 
+        // Save the current running task (if any) so it keeps running in the background.
+        self.save_current_task_state();
+
         let target = format!("{project_id}:{task_id}");
         self.output_lines.clear();
         self.output_scroll = 0;
@@ -735,6 +836,8 @@ impl App {
         self.pty_scrollback_len = 0;
         self.was_alternate_screen = false;
         self.mode = Mode::Output;
+        // Give this task its own PID slot so it doesn't race with background tasks.
+        self.child_pid = Arc::new(AtomicU32::new(0));
 
         // Size PTY and vt100 parser to match the output pane (minus borders
         // and title/status bars) so the child program renders for the correct width.

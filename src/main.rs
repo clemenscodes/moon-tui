@@ -48,8 +48,7 @@ async fn main() {
     // PTY master fd closing on exit also sends SIGHUP, but an explicit SIGTERM
     // covers non-interactive tasks and acts as a belt-and-suspenders for the
     // interactive case.
-    let child_pid = app.child_pid.load(std::sync::atomic::Ordering::SeqCst);
-    if child_pid != 0 {
+    for child_pid in app.all_child_pids() {
         unsafe {
             libc::kill(child_pid as libc::pid_t, libc::SIGTERM);
         }
